@@ -366,7 +366,7 @@ def demo_big_expression()->str:
 
 MENU = f"""{Fore.MAGENTA}{Style.BRIGHT}Choose an analysis:{Style.RESET_ALL}
   1) Cofactor (single variable → f_x and f_x')
-  2) Cofactor (multi-variable cube like ab'c → f_{cube})
+  2) Cofactor (multi-variable cube like ab'c → f_{{cube}})
   3) Smoothing S_x(f)
   4) Consensus C_x(f)
   5) Boolean Difference ∂f/∂x (optimized, symbolic if enabled)

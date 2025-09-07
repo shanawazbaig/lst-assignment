@@ -1,0 +1,52 @@
+BOOLEAN SOP ANALYSIS SUMMARY REPORT
+==================================================
+Generated: 2025-09-07 16:09:43
+
+Expression: a'b'c + ab'd + bc'd' + a'cd + bcd' + acd + abd' + ab'c'd + a'bc + b'cd + a'bd' + a'bc'd + abc + cd' + b'c'd
+Parsed: cd' + a'b'c + a'bc + a'bd' + a'cd + ab'd + abc + abd' + acd + b'c'd + b'cd + bc'd' + a'bc'd
+Variables: a, b, c, d
+
+VARIABLE 'a' ANALYSIS
+-------------------------
+Cofactor +: b'd + bc + bd' + cd' + cd
+Cofactor -: b'c + bc + bd' + cd' + cd + b'c'd + bc'd
+Smoothing: b'c + b'd + bc + bd' + cd' + cd + bc'd
+Consensus: bc + bd' + cd' + cd + b'c'd
+Bool Diff (Opt): (b'd + bc + bd' + cd) ⊕ (b'c + bc + bd' + cd + bc'd)
+Bool Diff (Naive): bc'd
+
+VARIABLE 'b' ANALYSIS
+-------------------------
+Cofactor +: a'c + a'd' + ac + ad' + c'd' + cd' + a'c'd
+Cofactor -: a'c + ad + c'd + cd' + cd
+Smoothing: a'c + a'd' + ac + ad' + ad + c'd' + c'd + cd' + cd
+Consensus: a'c + cd' + a'c'd + acd
+Bool Diff (Opt): (a'c + a'd' + ac + ad' + c'd' + a'c'd) ⊕ (a'c + ad + c'd + cd)
+Bool Diff (Naive): c'd' + ac'd
+
+VARIABLE 'c' ANALYSIS
+-------------------------
+Cofactor +: d' + a'b' + a'b + a'd + ab + ad + b'd
+Cofactor -: b'd + bd' + a'bd
+Smoothing: d' + a'b' + a'b + a'd + ab + ad + b'd
+Consensus: b'd + bd' + a'bd
+Bool Diff (Opt): (d' + a'b' + a'b + a'd + ab + ad + b'd) ⊕ (b'd + bd' + a'bd)
+Bool Diff (Naive): b'd' + abd
+
+VARIABLE 'd' ANALYSIS
+-------------------------
+Cofactor +: a'c + ab' + ac + b'c' + b'c + a'bc'
+Cofactor -: c + a'b + ab + bc'
+Smoothing: c + a'b + ab' + ab + b'c' + bc'
+Consensus: a'c + ac + b'c + a'bc'
+Bool Diff (Opt): (a'c + ab' + ac + b'c' + b'c + a'bc') ⊕ (c + a'b + ab + bc')
+Bool Diff (Naive): b'c' + abc'
+
+CUBE COFACTOR EXAMPLES
+-------------------------
+f_{ab} = c + d'
+f_{a'b} = c + d' + c'd
+f_{ab'c} = d' + d
+
+Analysis Complete
+==================================================
