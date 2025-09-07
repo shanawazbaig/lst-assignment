@@ -70,8 +70,7 @@ def parse_sop(expr: str) -> Cover:
         while i < len(term):
             ch = term[i]
             if ch == "+":
-                i += 1
-                continue
+                raise ValueError(f"Unexpected '+' in term '{term}' at position {i}")
             if not ch.isalpha():
                 raise ValueError(f"Bad character '{ch}' in term '{term}'")
             j = i + 1
