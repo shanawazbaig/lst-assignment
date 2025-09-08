@@ -1,382 +1,370 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Boolean SoP Analyzer (Optimized Version)
-========================================
-Adds an optimized Boolean difference computation that avoids
-the combinational blow-up seen in the generic XOR path by:
-  - Restricting to cubes containing the differentiation variable.
-  - Optionally emitting a compact symbolic XOR form instead of
-    fully expanding to a (possibly huge) OR-of-products.
+Boolean SoP Analyzer - Exact analyzer for Boolean expressions in Sum of Products form.
 
-Configuration:
-  UPPERCASE_MEANS_COMPLEMENT = True  (original behavior)
-    If False, 'A' is treated the same as 'a' (positive literal) unless primed.
-  DIFFERENCE_KEEP_SYMBOLIC_XOR = True
-    If True, derivative w.r.t x is returned (and displayed) as
-      (PosPart) ⊕ (NegPart)
-    rather than fully expanded SoP.
-
-Original functionality preserved unless you choose the optimized derivative.
-
+Features:
+- Cofactors w.r.t. variables or cubes (e.g., a, ab, ab')
+- Boolean Difference, Consensus, and Smoothing operations
+- Case-sensitive variables; complements use prime notation (a')
+- Input: keyboard or file; Output: same prime style
 """
 
 from __future__ import annotations
 import sys, os, re
-from typing import Dict, List, Sequence, Set, Tuple, FrozenSet
+from typing import Dict, List, Optional, Sequence, Set, Tuple, FrozenSet
 
 try:
     from colorama import init as colorama_init, Fore, Style
-except Exception:
-    class Dummy: RESET_ALL = ""
-    class ForeDummy(Dummy):
-        CYAN=GREEN=MAGENTA=YELLOW=RED=BLUE=""
-    class StyleDummy(Dummy):
-        BRIGHT=DIM=NORMAL=""
-    Fore=ForeDummy()
-    Style=StyleDummy()
+except ImportError:
+    class _Dummy:
+        RESET_ALL = CYAN = GREEN = MAGENTA = YELLOW = RED = BLUE = ""
+        BRIGHT = DIM = NORMAL = ""
+    Fore = Style = _Dummy()
     def colorama_init(): pass
 
 colorama_init()
 
-# ---------------- Configuration ----------------
-UPPERCASE_MEANS_COMPLEMENT = True
-DIFFERENCE_KEEP_SYMBOLIC_XOR = True
-# Safety threshold: if intermediate expansion grows beyond this many cubes
-# we abort further expansion (leave partially simplified).
-EXPANSION_CUBE_LIMIT = 5000
+Literal = Tuple[str, bool]  # (var, True) means var, (var, False) means var'
+Cube = FrozenSet[Literal]          # product term
+Cover = Set[Cube]                  # SoP: OR of cubes
 
-# (var, True) = positive literal, (var, False) = complemented
-Literal = Tuple[str, bool]
-Cube    = FrozenSet[Literal]
-Cover   = Set[Cube]
+VERBOSE = True
+PROGRESS_INTERVAL = 250
+EXPANSION_CUBE_LIMIT = 4000
 
-# -------------- Parsing & Formatting -----------
+def log(msg: str):
+    if VERBOSE: print(f"[info] {msg}")
+
+def progress(kind: str, count: int, total: Optional[int] = None):
+    if VERBOSE and count % PROGRESS_INTERVAL == 0:
+        suffix = f"{count}/{total}" if total else str(count)
+        print(f"[working] {kind}: {suffix} ...", flush=True)
+
 
 def normalize_var(token: str) -> Tuple[str, bool]:
+    """Convert literal token to (name, polarity). Case-sensitive; prime indicates complement."""
     t = token.strip()
-    if not t: raise ValueError("Empty token")
+    if not t:
+        raise ValueError("Empty token")
     prime = t.endswith("'")
-    base  = t.rstrip("'")
-    if not base: raise ValueError(f"Bad literal: {token}")
-    v = base[0].lower() + base[1:]
-    if UPPERCASE_MEANS_COMPLEMENT and base[0].isupper() and not prime:
-        return v, False
-    return v, (not prime)
+    base = t.rstrip("'")
+    if not base:
+        raise ValueError(f"Bad literal: {token}")
+    return base, (not prime)
+
 
 def parse_sop(expr: str) -> Cover:
+    """Parse SoP string: e.g. "ab + a'c + bcd". '+' separates terms."""
     expr = expr.strip()
     if expr == "0": return set()
     if expr == "1": return {frozenset()}
     terms = [t.strip() for t in expr.replace(" ", "").split("+")]
     cover: Cover = set()
     for term in terms:
-        if term in ("","0"): continue
-        if term == "1":
-            cover.add(frozenset()); continue
+        if term == "" or term == "0": continue
+        if term == "1": 
+            cover.add(frozenset())
+            continue
         lits: List[Literal] = []
-        i=0
+        i = 0
         while i < len(term):
             ch = term[i]
-            if not ch.isalpha(): raise ValueError(f"Bad char '{ch}' in term '{term}'")
-            j=i+1
-            while j < len(term) and term[j].isdigit(): j+=1
-            prime=False
-            if j < len(term) and term[j]=="'":
-                prime=True; j+=1
+            if ch == "+":
+                raise ValueError(f"Unexpected '+' in term '{term}' at position {i}")
+            if not ch.isalpha():
+                raise ValueError(f"Bad character '{ch}' in term '{term}'")
+            j = i + 1
+            while j < len(term) and term[j].isdigit(): j += 1
+            prime = False
+            if j < len(term) and term[j] == "'":
+                prime = True
+                j += 1
             token = term[i:j]
-            v,pol = normalize_var(token + ("'" if prime else ""))
-            lits.append((v,pol))
-            i=j
+            v, pol = normalize_var(token + ("'" if prime else ""))
+            lits.append((v, pol))
+            i = j
         cover.add(frozenset(lits))
     return simplify_cover(cover)
 
-def parse_cube(expr: str) -> Dict[str,bool]:
-    expr = expr.strip().replace(" ","")
-    if expr in ("","1"): return {}
+
+def parse_cube(expr: str) -> Dict[str, bool]:
+    """Parse cube like "ab'c" into assignment dict {'a':True, 'b':False, 'c':True}."""
+    expr = expr.strip().replace(" ", "")
+    if expr in ("", "1"): return {}
     if expr == "0": return {"__IMPOSSIBLE__": True}
-    assign: Dict[str,bool]={}
-    i=0
+    assign: Dict[str, bool] = {}
+    i = 0
     while i < len(expr):
-        ch=expr[i]
-        if not ch.isalpha(): raise ValueError(f"Bad char '{ch}' in cube '{expr}'")
-        j=i+1
-        while j < len(expr) and expr[j].isdigit(): j+=1
-        prime=False
-        if j < len(expr) and expr[j]=="'":
-            prime=True; j+=1
-        token=expr[i:j]
-        v,pol=normalize_var(token + ("'" if prime else ""))
-        if v in assign and assign[v]!=pol:
+        ch = expr[i]
+        if not ch.isalpha():
+            raise ValueError(f"Bad character '{ch}' in cube '{expr}'")
+        j = i + 1
+        while j < len(expr) and expr[j].isdigit(): j += 1
+        prime = False
+        if j < len(expr) and expr[j] == "'":
+            prime = True
+            j += 1
+        token = expr[i:j]
+        v, pol = normalize_var(token + ("'" if prime else ""))
+        if v in assign and assign[v] != pol:
             return {"__IMPOSSIBLE__": True}
-        assign[v]=pol
-        i=j
+        assign[v] = pol
+        i = j
     return assign
 
+
 def lit_str(var: str, pol: bool) -> str:
+    """Format literal as var or var'."""
     return f"{var}{'' if pol else "'"}"
 
 def cube_str(c: Cube) -> str:
-    if not c: return "1"
-    return "".join(lit_str(v,p) for v,p in sorted(c))
+    """Format cube as concatenated literals, or '1' for empty cube."""
+    return "1" if len(c) == 0 else "".join(lit_str(v, p) for v, p in sorted(c))
 
 def cover_str(cover: Cover) -> str:
+    """Format cover as 'term + term + ...' or '0' for empty cover."""
     if not cover: return "0"
-    return " + ".join(cube_str(c) for c in sorted(cover, key=lambda x:(len(x),sorted(x))))
+    return " + ".join(cube_str(c) for c in sorted(cover, key=lambda x: (len(x), sorted(x))))
 
-# -------------- Core Cover Algebra -------------
+
+# ---------- Core Boolean Cover Algebra ----------
 
 def simplify_cover(cover: Cover) -> Cover:
-    # remove contradictory literals & duplicates
-    cleaned:Set[Cube]=set()
+    """Simplify via contradiction removal, deduplication, and absorption."""
+    cleaned: Set[Cube] = set()
     for c in cover:
-        d:Dict[str,bool]={}
-        ok=True
-        for v,p in c:
-            if v in d and d[v]!=p:
-                ok=False; break
-            d[v]=p
+        d: Dict[str, bool] = {}
+        ok = True
+        for v, p in c:
+            if v in d and d[v] != p:
+                ok = False
+                break
+            d[v] = p
         if ok:
             cleaned.add(frozenset(d.items()))
-    # absorption
-    minimal=set(cleaned)
+    
+    minimal: Set[Cube] = set(cleaned)
     for c in cleaned:
         for u in cleaned:
-            if u is c: continue
-            if u.issubset(c):
+            if u is not c and u.issubset(c):
                 minimal.discard(c)
                 break
     return minimal
 
+
 def vars_in_cover(cover: Cover) -> List[str]:
-    s:set[str]=set()
+    """Get sorted list of all variables in cover."""
+    s: Set[str] = set()
     for c in cover:
-        for v,_ in c: s.add(v)
+        for v, _ in c:
+            s.add(v)
     return sorted(s)
 
-def cofactor(cover: Cover, assignment: Dict[str,bool]) -> Cover:
-    if "__IMPOSSIBLE__" in assignment: return set()
-    out:Set[Cube]=set()
+
+def cofactor(cover: Cover, assignment: Dict[str, bool]) -> Cover:
+    """General cofactor for cube assignment. Drop satisfied literals, discard contradictory cubes."""
+    if "__IMPOSSIBLE__" in assignment:
+        return set()
+    out: Set[Cube] = set()
     for c in cover:
-        new:Set[Literal]=set()
-        discard=False
-        for v,p in c:
+        discard = False
+        new: Set[Literal] = set()
+        for v, p in c:
             if v in assignment:
-                if assignment[v]!=p:
-                    discard=True; break
-                # satisfied literal dropped
+                if assignment[v] != p:
+                    discard = True
+                    break
             else:
-                new.add((v,p))
+                new.add((v, p))
         if not discard:
             out.add(frozenset(new))
     return simplify_cover(out)
 
+
 def and_covers(f: Cover, g: Cover) -> Cover:
+    """Conjunct two covers (distribute products), then simplify."""
     if not f or not g: return set()
-    out:Set[Cube]=set()
+    out: Set[Cube] = set()
+    total = len(f) * len(g)
+    produced = 0
     for a in f:
         for b in g:
-            out.add(frozenset(set(a)|set(b)))
+            produced += 1
+            if produced % PROGRESS_INTERVAL == 0:
+                progress("AND distribute", produced, total)
+            out.add(frozenset(set(a) | set(b)))
             if len(out) > EXPANSION_CUBE_LIMIT:
+                log(f"AND early stop: > {EXPANSION_CUBE_LIMIT} cubes")
                 return simplify_cover(out)
     return simplify_cover(out)
 
 def or_covers(f: Cover, g: Cover) -> Cover:
-    return simplify_cover(set(f)|set(g))
+    """Disjunct two covers and simplify."""
+    return simplify_cover(set(f) | set(g))
+
+def complement_lit(l: Literal) -> Literal:
+    """Return complemented literal."""
+    v, p = l
+    return (v, not p)
+
 
 def subtract_cube(t: Cube, u: Cube) -> Set[Cube]:
-    dt,du = dict(t), dict(u)
-    # contradiction -> u false under t
-    for v,p in dt.items():
-        if v in du and du[v]!=p:
+    """Compute t ∧ ¬u as a cover."""
+    dt, du = dict(t), dict(u)
+    # Contradiction?
+    for v, p in dt.items():
+        if v in du and du[v] != p:
             return {t}
-    # subset?
-    for v,p in du.items():
-        if v not in dt or dt[v]!=p:
+    # u subset of t?
+    subset = True
+    for v, p in du.items():
+        if v not in dt or dt[v] != p:
+            subset = False
             break
-    else:
-        return set()
-    # expand on missing literals (limit)
-    res:Set[Cube]=set()
-    for v,p in du.items():
+    if subset: return set()
+    # Expand on each missing literal
+    res: Set[Cube] = set()
+    for v, p in du.items():
         if v not in dt:
-            new=set(t)
+            new = set(t)
             new.add((v, not p))
             res.add(frozenset(new))
-            if len(res) > EXPANSION_CUBE_LIMIT:
-                return res
     return res
 
+
 def subtract_cover(f: Cover, g: Cover) -> Cover:
-    current=set(f)
-    for u in g:
-        nxt:Cover=set()
+    """Compute f ∧ ¬g exactly by repeated cube subtraction."""
+    current: Cover = set(f)
+    g_list = list(g)
+    total = len(g_list)
+    step = 0
+    for u in g_list:
+        step += 1
+        progress("Subtract cover", step, total)
+        next_set: Cover = set()
+        inner = 0
         for t in current:
-            nxt |= subtract_cube(t,u)
-            if len(nxt) > EXPANSION_CUBE_LIMIT:
-                current = simplify_cover(nxt)
+            inner += 1
+            if inner % PROGRESS_INTERVAL == 0:
+                progress("  subtract cube", inner)
+            next_set |= subtract_cube(t, u)
+            if len(next_set) > EXPANSION_CUBE_LIMIT:
+                log(f"SUB early stop at step {step}: > {EXPANSION_CUBE_LIMIT} cubes")
+                current = simplify_cover(next_set)
                 break
-        current = simplify_cover(nxt)
-        if not current:
-            break
+        current = simplify_cover(next_set)
+        if not current: break
     return simplify_cover(current)
 
 def xor_covers(f: Cover, g: Cover) -> Cover:
-    # (f ∧ ¬g) ∨ (g ∧ ¬f)
-    return simplify_cover(or_covers(subtract_cover(f,g), subtract_cover(g,f)))
+    """Compute (f ⊕ g) = (f ∧ ¬g) ∨ (g ∧ ¬f)."""
+    a = subtract_cover(f, g)
+    b = subtract_cover(g, f)
+    return simplify_cover(or_covers(a, b))
 
-# -------------- High-level (original) -----------
+
+# ---------- High-level Operations w.r.t. a Variable ----------
 
 def positive_negative_cofactors(f: Cover, x: str) -> Tuple[Cover, Cover]:
-    return cofactor(f,{x:True}), cofactor(f,{x:False})
+    """Return (f_x, f_x')."""
+    return cofactor(f, {x: True}), cofactor(f, {x: False})
 
 def smoothing(f: Cover, x: str) -> Cover:
-    fx1,fx0 = positive_negative_cofactors(f,x)
-    return or_covers(fx1,fx0)
+    """S_x(f) = f_x + f_x'"""
+    fx1, fx0 = positive_negative_cofactors(f, x)
+    return or_covers(fx1, fx0)
 
 def consensus_operator(f: Cover, x: str) -> Cover:
-    fx1,fx0 = positive_negative_cofactors(f,x)
-    return and_covers(fx1,fx0)
+    """C_x(f) = f_x · f_x'"""
+    fx1, fx0 = positive_negative_cofactors(f, x)
+    return and_covers(fx1, fx0)
 
-def boolean_difference_naive(f: Cover, x: str) -> Cover:
-    fx1,fx0 = positive_negative_cofactors(f,x)
-    return xor_covers(fx1,fx0)
 
-# -------------- Optimized Boolean Difference ----
+def boolean_difference(f: Cover, x: str) -> Cover:
+    """∂f/∂x = f_x ⊕ f_x' (optimized: only process cubes containing x)."""
+    relevant: Cover = set(c for c in f if (x, True) in c or (x, False) in c)
+    if not relevant: return set()
+    log(f"Boolean difference '{x}': relevant cubes = {len(relevant)} (original {len(f)})")
+    fx1 = cofactor(relevant, {x: True})
+    fx0 = cofactor(relevant, {x: False})
+    if fx1 == fx0: return set()
+    if (len(fx1) * len(fx0)) > EXPANSION_CUBE_LIMIT:
+        log("Cofactor product large; XOR may be truncated if limit exceeded")
+    return xor_covers(fx1, fx0)
 
-def extract_relevant_for_var(f: Cover, x: str) -> Cover:
-    """Keep only cubes that mention x (pos or neg)."""
-    out:Set[Cube]=set()
-    for c in f:
-        for v,_ in c:
-            if v == x:
-                out.add(c)
-                break
-    return out
 
-def cofactors_restricted(f_reduced: Cover, x: str) -> Tuple[Cover, Cover]:
-    """Given only cubes containing x/x', strip the literal and separate pos/neg parts."""
-    pos:Set[Cube]=set()
-    neg:Set[Cube]=set()
-    for c in f_reduced:
-        new_lits=[]
-        pos_here=False
-        neg_here=False
-        for v,p in c:
-            if v==x:
-                if p: pos_here=True
-                else: neg_here=True
-            else:
-                new_lits.append((v,p))
-        cube_new=frozenset(new_lits)
-        if pos_here and neg_here:
-            # (Should not happen in cleaned cubes) -> contradictory, skip
-            continue
-        if pos_here:
-            pos.add(cube_new)
-        else:
-            neg.add(cube_new)
-    return simplify_cover(pos), simplify_cover(neg)
 
-def boolean_difference_var_optimized(f: Cover, x: str, keep_symbolic: bool = DIFFERENCE_KEEP_SYMBOLIC_XOR) -> Tuple[str, Cover]:
-    """
-    Returns (display_string, expanded_cover_if_available).
-    If keep_symbolic is True, display_string is a symbolic XOR form without full expansion.
-    """
-    relevant = extract_relevant_for_var(f,x)
-    if not relevant:
-        return f"0  (x not present)", set()
-    pos, neg = cofactors_restricted(relevant, x)
-    if keep_symbolic:
-        pos_s = cover_str(pos) or "0"
-        neg_s = cover_str(neg) or "0"
-        if pos_s=="0" and neg_s=="0":
-            return "0", set()
-        if pos_s=="0":  # 0 ⊕ N = N
-            return neg_s, neg
-        if neg_s=="0":  # P ⊕ 0 = P
-            return pos_s, pos
-        symbolic = f"({pos_s}) ⊕ ({neg_s})"
-        return symbolic, set()  # we intentionally skip huge expansion
-    # Else expand explicitly (might still blow up on pathological cases)
-    expanded = xor_covers(pos, neg)
-    return cover_str(expanded), expanded
-
-# -------------- Reporting -----------------------
-
-def variable_report(f: Cover) -> str:
-    pos_ct:Dict[str,int]={}
-    neg_ct:Dict[str,int]={}
-    for c in f:
-        for v,p in c:
-            if p: pos_ct[v]=pos_ct.get(v,0)+1
-            else: neg_ct[v]=neg_ct.get(v,0)+1
-    all_vars=sorted(set(pos_ct)|set(neg_ct))
-    lines=[]
-    for v in all_vars:
-        p = pos_ct.get(v,0)
-        n = neg_ct.get(v,0)
-        if p and n:
-            kind=f"{Fore.RED}{Style.BRIGHT}binate{Style.RESET_ALL}"
-        elif p:
-            kind=f"{Fore.GREEN}positive-unate{Style.RESET_ALL}"
-        else:
-            kind=f"{Fore.GREEN}negative-unate{Style.RESET_ALL}"
-        lines.append(f"  {v}: +{p}  -{n}   {kind}")
-    return "\n".join(lines) if lines else "(no variables)"
-
-# -------------- I/O Helpers ---------------------
 
 def read_sop_from_file(path: str) -> Cover:
-    with open(path,"r",encoding="utf-8") as fh:
-        lines=[ln.strip() for ln in fh if ln.strip() and not ln.strip().startswith("#")]
+    """Read SoP from file: one SoP per line OR one product term per line (auto-detected)."""
+    with open(path, "r", encoding="utf-8") as fh:
+        lines = [ln.strip() for ln in fh if ln.strip() and not ln.strip().startswith("#")]
     if not lines: return set()
+    
     if any("+" in ln for ln in lines):
-        cov:set[Cube]=set()
+        cov: Cover = set()
         for ln in lines:
             cov = or_covers(cov, parse_sop(ln))
         return cov
-    cover:set[Cube]=set()
-    for ln in lines:
-        cover |= parse_sop(ln)
-    return cover
+    else:
+        cover: Cover = set()
+        for ln in lines:
+            cover |= parse_sop(ln)
+        return cover
 
-# -------------- CLI Utilities -------------------
+
+def variable_report(f: Cover) -> str:
+    """Build variable usage report (case-sensitive)."""
+    pos: Dict[str, int] = {}
+    neg: Dict[str, int] = {}
+    for c in f:
+        for v, p in c:
+            (pos if p else neg)[v] = (pos if p else neg).get(v, 0) + 1
+    vars_all = sorted(set(pos) | set(neg))
+    lines: List[str] = []
+    for v in vars_all:
+        p, n = pos.get(v, 0), neg.get(v, 0)
+        if p and n:
+            kind = f"{Fore.RED}{Style.BRIGHT}binate{Style.RESET_ALL}"
+        elif p:
+            kind = f"{Fore.GREEN}positive-unate{Style.RESET_ALL}"
+        else:
+            kind = f"{Fore.GREEN}negative-unate{Style.RESET_ALL}"
+        lines.append(f"  {v}: +{p}  -{n}   {kind}")
+    return "\n".join(lines) if lines else "(no variables)"
+
+
+
+
 
 def print_header():
-    print(f"{Style.BRIGHT}{Fore.CYAN}Boolean SoP Analyzer (Optimized){Style.RESET_ALL}")
-    print("Conventions: variables a,b,c; complements as a'.")
-    if UPPERCASE_MEANS_COMPLEMENT:
-        print("NOTE: Uppercase without prime is treated as complemented (A == a').\n")
-    else:
-        print("NOTE: Upper/lowercase are the same (A == a). Use prime for complement.\n")
+    print(f"{Style.BRIGHT}{Fore.CYAN}Boolean SoP Analyzer{Style.RESET_ALL}")
+    print("Conventions: variables like a, b, c ... complements as a' (prime). Variables are case-sensitive; use primes for complements.\n")
 
 def print_formula_cheatsheet(x: str):
     print(f"{Fore.MAGENTA}Formulas w.r.t. {x}:{Style.RESET_ALL}")
-    print(f"  f_{x}   : positive cofactor  (x=1)")
-    print(f"  f_{x}'  : negative cofactor  (x=0)")
-    print(f"  S_{x}(f)= f_{x} + f_{x}'")
-    print(f"  C_{x}(f)= f_{x} · f_{x}'")
-    print(f"  ∂f/∂{x} = f_{x} ⊕ f_{x}'\n")
+    print(f"  Positive cofactor:   {Style.BRIGHT}f_{x}{Style.RESET_ALL}  = f with {x}=1")
+    print(f"  Negative cofactor:   {Style.BRIGHT}f_{x}'{Style.RESET_ALL} = f with {x}=0")
+    print(f"  Smoothing:           {Style.BRIGHT}S_{x}(f){Style.RESET_ALL} = f_{x} + f_{x}'")
+    print(f"  Consensus operator:  {Style.BRIGHT}C_{x}(f){Style.RESET_ALL} = f_{x} · f_{x}'")
+    print(f"  Boolean difference:  {Style.BRIGHT}∂f/∂{x}{Style.RESET_ALL}  = f_{x} ⊕ f_{x}'\n")
 
-def demo_big_expression()->str:
+def demo_big_expression() -> str:
     return "a'b'c + ab'd + bc'd' + a'cd + bcd' + acd + abd' + ab'c'd + a'bc + b'cd + a'bd' + a'bc'd + abc + cd' + b'c'd"
 
-# -------------- Main CLI ------------------------
+def get_valid_variable(prompt: str) -> Optional[str]:
+    """Get and validate variable input."""
+    x = input(prompt).strip()
+    if not x or not x[0].isalpha():
+        print("  Invalid variable.\n")
+        return None
+    return x
 
-MENU = f"""{Fore.MAGENTA}{Style.BRIGHT}Choose an analysis:{Style.RESET_ALL}
-  1) Cofactor (single variable → f_x and f_x')
-  2) Cofactor (multi-variable cube like ab'c → f_{cube})
-  3) Smoothing S_x(f)
-  4) Consensus C_x(f)
-  5) Boolean Difference ∂f/∂x (optimized, symbolic if enabled)
-  6) Boolean Difference ∂f/∂x (original naive expansion)
-  7) Show formulas for a variable
-  0) Exit
-"""
 
 def main(argv: Sequence[str]) -> int:
     print_header()
+    
+    # Load expression
     if len(argv) >= 2 and os.path.exists(argv[1]):
         print(f"{Fore.YELLOW}Loading from file:{Style.RESET_ALL} {argv[1]}")
         f = read_sop_from_file(argv[1])
@@ -388,64 +376,70 @@ def main(argv: Sequence[str]) -> int:
             print(f"  Using demo: {Style.BRIGHT}{line}{Style.RESET_ALL}")
         f = parse_sop(line)
 
-    print(f"\n{Fore.CYAN}Parsed f:{Style.RESET_ALL} {Style.BRIGHT}{cover_str(f)}{Style.RESET_ALL}")
-    print(f"{Fore.CYAN}Variables:{Style.RESET_ALL} {', '.join(vars_in_cover(f)) or '(none)'}")
+    print(f"\n{Fore.CYAN}Parsed f:{Style.RESET_ALL}  {Style.BRIGHT}{cover_str(f)}{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}Variables (case-sensitive):{Style.RESET_ALL} {', '.join(vars_in_cover(f)) or '(none)'}")
     print(f"{Fore.CYAN}Variable report:\n{Style.RESET_ALL}{variable_report(f)}\n")
 
+    MENU = f"""{Fore.MAGENTA}{Style.BRIGHT}Choose an analysis:{Style.RESET_ALL}
+  1) Cofactor (single variable → show f_x and f_x')
+  2) Cofactor (multivariable like ab, ab'c → show f_{{ab}})
+  3) Smoothing S_x(f)
+  4) Consensus C_x(f)
+  5) Boolean Difference ∂f/∂x
+  0) Exit
+"""
     while True:
         print(MENU)
-        choice = input(f"{Fore.YELLOW}Pick 0-7:{Style.RESET_ALL} ").strip()
+        choice = input(f"{Fore.YELLOW}Pick 0-5:{Style.RESET_ALL} ").strip()
         if choice == "0":
             print("Bye!")
             return 0
         elif choice == "1":
-            x = input("Variable: ").strip().lower()
-            if not x or not x[0].isalpha(): print("  Invalid.\n"); continue
-            fx1,fx0 = positive_negative_cofactors(f,x)
-            print(f"  f_{x}   = {cover_str(fx1)}")
-            print(f"  f_{x}'  = {cover_str(fx0)}\n")
+            x = get_valid_variable("Variable (case-sensitive, e.g., a or A): ")
+            if x:
+                fx1, fx0 = positive_negative_cofactors(f, x)
+                print(f"  f_{x}   = {cover_str(fx1)}")
+                print(f"  f_{x}'  = {cover_str(fx0)}\n")
         elif choice == "2":
-            cube_expr = input("Cube (e.g. ab'c): ").strip()
+            cube_expr = input("multivariable cube (e.g., ab'c): ").strip()
             try:
                 cube = parse_cube(cube_expr)
+                if "__IMPOSSIBLE__" in cube:
+                    print("  The given cube is contradictory (unsatisfiable). f_cube = 0\n")
+                else:
+                    f_cube = cofactor(f, cube)
+                    print(f"  f_{{{cube_expr}}} = {cover_str(f_cube)}\n")
             except Exception as e:
-                print(f"  Parse error: {e}\n"); continue
-            if "__IMPOSSIBLE__" in cube:
-                print("  Contradictory cube => f_cube = 0\n"); continue
-            fc = cofactor(f,cube)
-            print(f"  f_{{{cube_expr}}} = {cover_str(fc)}\n")
+                print(f"  Parse error: {e}\n")
         elif choice == "3":
-            x = input("Variable for smoothing: ").strip().lower()
-            if not x or not x[0].isalpha(): print("  Invalid.\n"); continue
-            print_formula_cheatsheet(x)
-            s = smoothing(f,x)
-            print(f"  S_{x}(f) = {cover_str(s)}\n")
+            x = get_valid_variable("Variable for smoothing (case-sensitive): ")
+            if x:
+                print_formula_cheatsheet(x)
+                s = smoothing(f, x)
+                print(f"  S_{x}(f) = {cover_str(s)}\n")
         elif choice == "4":
-            x = input("Variable for consensus: ").strip().lower()
-            if not x or not x[0].isalpha(): print("  Invalid.\n"); continue
-            print_formula_cheatsheet(x)
-            cns = consensus_operator(f,x)
-            print(f"  C_{x}(f) = {cover_str(cns)}\n")
+            x = get_valid_variable("Variable for consensus (case-sensitive): ")
+            if x:
+                print_formula_cheatsheet(x)
+                cns = consensus_operator(f, x)
+                print(f"  C_{x}(f) = {cover_str(cns)}\n")
         elif choice == "5":
-            x = input("Variable for Boolean difference (optimized): ").strip().lower()
-            if not x or not x[0].isalpha(): print("  Invalid.\n"); continue
-            print_formula_cheatsheet(x)
-            display, _ = boolean_difference_var_optimized(f,x, keep_symbolic=DIFFERENCE_KEEP_SYMBOLIC_XOR)
-            print(f"  ∂f/∂{x} = {display}")
-            if DIFFERENCE_KEEP_SYMBOLIC_XOR:
-                print("  (Symbolic XOR form kept. Set DIFFERENCE_KEEP_SYMBOLIC_XOR=False to expand.)\n")
-            else:
-                print()
-        elif choice == "6":
-            x = input("Variable for Boolean difference (naive / full): ").strip().lower()
-            if not x or not x[0].isalpha(): print("  Invalid.\n"); continue
-            print_formula_cheatsheet(x)
-            bd = boolean_difference_naive(f,x)
-            print(f"  ∂f/∂{x} (expanded) = {cover_str(bd)}\n")
-        elif choice == "7":
-            x = input("Variable: ").strip().lower()
-            if not x or not x[0].isalpha(): print("  Invalid.\n"); continue
-            print_formula_cheatsheet(x)
+            x = get_valid_variable("Variable for Boolean difference (case-sensitive): ")
+            if x:
+                print_formula_cheatsheet(x)
+                relevant = [c for c in f if (x, True) in c or (x, False) in c]
+                if not relevant:
+                    print(f"  (No cubes contain {x} / {x}') => ∂f/∂{x} = 0\n")
+                else:
+                    pos_cubes = [c for c in relevant if (x, True) in c]
+                    neg_cubes = [c for c in relevant if (x, False) in c]
+                    print(f"  Relevant cubes ({len(relevant)} of {len(f)} total):")
+                    print(f"    with {x}:   {', '.join(cube_str(c) for c in pos_cubes)}")
+                    print(f"    with {x}':  {', '.join(cube_str(c) for c in neg_cubes) or '-'}")
+                    d = boolean_difference(f, x)
+                    print(f"  ∂f/∂{x} = {cover_str(d)}\n")
+                    if len(d) > 50:
+                        print("  (Result large; consider additional manual simplification.)\n")
         else:
             print("  Unknown choice.\n")
     return 0
